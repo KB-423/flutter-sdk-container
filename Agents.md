@@ -126,9 +126,12 @@ Flutter 版本**不设默认值**，必须由用户显式指定，支持以下 2
 4. 点击绿色的 **Run workflow** 按钮启动构建。
 
 #### 方式二：通过 Git Tag 触发（正式发布）
-推送带有版本号的 Git Tag 时，CI 会自动截取版本号并以此版本拉取 Flutter SDK 进行构建：
+推送带有版本号的 Git Tag（支持带 `v` 或不带 `v`，如 `3.47.7` 或 `v3.47.7`），CI 会自动截取版本号并以此版本拉取 Flutter SDK 进行构建：
 ```bash
-# 例如打包 3.47.7 版本
+# 例如打包 3.47.7 版本（以下两种写法均可触发）
+git tag 3.47.7
+git push origin 3.47.7
+# 或者
 git tag v3.47.7
 git push origin v3.47.7
 ```
@@ -138,7 +141,8 @@ git push origin v3.47.7
 
 ### 5.2 如何将镜像推送到 Docker Hub
 
-工作流支持**双通道镜像发布**：默认无缝发布到 GitHub Container Registry (GHCR)；在配置了 Docker Hub 凭据后，将同步自动推送到 Docker Hub。
+工作流目前专为 **Docker Hub** 打造（已移除 GHCR）：
+
 
 #### 配置步骤：
 1. **获取 Docker Hub Access Token**：
