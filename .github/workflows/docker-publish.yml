@@ -1,4 +1,4 @@
-name: Build and Publish Multi-Platform Flutter SDK Container
+name: Build and Publish Multi-Platform Flutter SDK Container to Docker Hub
 
 on:
   push:
@@ -11,22 +11,18 @@ on:
         required: true
         type: string
       push_image:
-        description: 'Push image to registry'
+        description: 'Push image to Docker Hub'
         required: true
         default: true
         type: boolean
 
-env:
-  REGISTRY: ghcr.io
-
 jobs:
-  # 阶段 1：解析并校验目标 Flutter 版本，格式化镜像名称为全小写
+  # 阶段 1：解析并校验目标 Flutter 版本与 Docker Hub 仓库名称（格式化全小写）
   prepare:
     runs-on: ubuntu-latest
     outputs:
       flutter_version: ${{ steps.version.outputs.flutter_version }}
-      image_name: ${{ steps.image.outputs.image_name }}
-      dockerhub_repo: ${{ steps.image.outputs.dockerhub_repo }}
+      dockerhub_image: ${{ steps.image.outputs.dockerhub_image }}
     steps:
       - name: Determine Flutter version
         id: version
@@ -42,22 +38,19 @@ jobs:
           echo "Target Flutter version: $VERSION"
           echo "flutter_version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Format repository names to lowercase (Docker/OCI Requirement)
+      - name: Format Docker Hub repository name to lowercase (Docker/OCI Requirement)
         id: image
         run: |
-          # Docker / OCI 规范强制要求镜像仓库名必须为全小写
-          LOWER_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "image_name=$LOWER_REPO" >> "$GITHUB_OUTPUT"
-          echo "GHCR image name: $LOWER_REPO"
-
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
-            DH_USER=$(echo "${{ secrets.DOCKERHUB_USERNAME }}" | tr '[:upper:]' '[:lower:]')
-            DH_REPO=$(echo "${{ secrets.DOCKERHUB_REPO || 'flutter-sdk-container' }}" | tr '[:upper:]' '[:lower:]')
-            echo "dockerhub_repo=${DH_USER}/${DH_REPO}" >> "$GITHUB_OUTPUT"
-            echo "Docker Hub image name: ${DH_USER}/${DH_REPO}"
-          else
-            echo "dockerhub_repo=" >> "$GITHUB_OUTPUT"
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "Error: DOCKERHUB_USERNAME or DOCKERHUB_TOKEN secret is missing! Please configure them in repository Settings -> Secrets and variables -> Actions." >&2
+            exit 1
           fi
+
+          DH_USER=$(echo "${{ secrets.DOCKERHUB_USERNAME }}" | tr '[:upper:]' '[:lower:]')
+          DH_REPO=$(echo "${{ secrets.DOCKERHUB_REPO || 'flutter-sdk-container' }}" | tr '[:upper:]' '[:lower:]')
+          FULL_IMAGE="${DH_USER}/${DH_REPO}"
+          echo "dockerhub_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Target Docker Hub image: $FULL_IMAGE"
 
   # 阶段 2：独立申请 x64 (ubuntu-latest) 与 arm64 (ubuntu-24.04-arm) 两个硬件平台并行打包
   build:
@@ -73,9 +66,6 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             platform-clean: linux-arm64
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -89,20 +79,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry (GHCR)
+      - name: Log in to Docker Hub
         if: inputs.push_image != false
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub (Optional)
-        if: inputs.push_image != false && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Configure Buildx outputs
         id: outputs
@@ -110,20 +92,11 @@ jobs:
           if [ "${{ inputs.push_image }}" = "false" ]; then
             echo "build_outputs=type=image,push=false" >> "$GITHUB_OUTPUT"
           else
-            GHCR_IMG="${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}"
-            DH_IMG="${{ needs.prepare.outputs.dockerhub_repo }}"
-
-            OUTPUTS="type=image,name=${GHCR_IMG},push-by-digest=true,name-canonical=true,push=true"
-            if [ -n "$DH_IMG" ] && [ -n "${{ env.DOCKERHUB_TOKEN }}" ]; then
-              OUTPUTS="${OUTPUTS}
-          type=image,name=${DH_IMG},push-by-digest=true,name-canonical=true,push=true"
-            fi
-            echo "build_outputs<<EOF" >> "$GITHUB_OUTPUT"
-            echo "$OUTPUTS" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
+            OUTPUTS="type=image,name=${{ needs.prepare.outputs.dockerhub_image }},push-by-digest=true,name-canonical=true,push=true"
+            echo "build_outputs=$OUTPUTS" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push single platform by digest
+      - name: Build and push single platform by digest to Docker Hub
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -152,14 +125,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # 阶段 3：合并各架构 digest 并发布统一的多平台 manifest
+  # 阶段 3：合并各架构 digest 并向 Docker Hub 发布统一的多平台 manifest
   merge:
     needs: [prepare, build]
     if: inputs.push_image != false
     runs-on: ubuntu-latest
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - name: Download all platform digests
@@ -172,37 +142,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry (GHCR)
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Log in to Docker Hub (Optional)
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
-
-      - name: Create and push multi-platform manifest for GHCR
+      - name: Create and push multi-platform manifest to Docker Hub
         working-directory: ${{ runner.temp }}/digests
         run: |
-          GHCR_IMAGE="${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}"
-          VERSION="${{ needs.prepare.outputs.flutter_version }}"
-          SOURCES=$(printf "${GHCR_IMAGE}@sha256:%s " *)
-          echo "Assembling GHCR manifest from sources: $SOURCES"
-          docker buildx imagetools create \
-            -t "${GHCR_IMAGE}:${VERSION}" \
-            -t "${GHCR_IMAGE}:latest" \
-            $SOURCES
-
-      - name: Create and push multi-platform manifest for Docker Hub (Optional)
-        if: needs.prepare.outputs.dockerhub_repo != '' && env.DOCKERHUB_TOKEN != ''
-        working-directory: ${{ runner.temp }}/digests
-        run: |
-          DH_IMAGE="${{ needs.prepare.outputs.dockerhub_repo }}"
+          DH_IMAGE="${{ needs.prepare.outputs.dockerhub_image }}"
           VERSION="${{ needs.prepare.outputs.flutter_version }}"
           SOURCES=$(printf "${DH_IMAGE}@sha256:%s " *)
           echo "Assembling Docker Hub manifest from sources: $SOURCES"
@@ -211,7 +160,7 @@ jobs:
             -t "${DH_IMAGE}:latest" \
             $SOURCES
 
-  # 阶段 4：通过 QEMU 与原生执行验证已发布的多平台镜像
+  # 阶段 4：从 Docker Hub 拉取并验证多平台镜像
   verify:
     needs: [prepare, merge]
     if: inputs.push_image != false
@@ -222,17 +171,17 @@ jobs:
         with:
           platforms: linux/amd64,linux/arm64
 
-      - name: Log in to GitHub Container Registry
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Verify multi-arch images
+      - name: Verify multi-arch images from Docker Hub
         run: |
-          IMAGE_TAG="${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}:${{ needs.prepare.outputs.flutter_version }}"
-          echo "===> Pulling and verifying x86_64 image..."
+          IMAGE_TAG="${{ needs.prepare.outputs.dockerhub_image }}:${{ needs.prepare.outputs.flutter_version }}"
+          echo "===> Pulling and verifying x86_64 image from Docker Hub..."
           docker run --rm --platform linux/amd64 "$IMAGE_TAG" flutter --version
-          echo "===> Pulling and verifying arm64 image via QEMU..."
+          echo "===> Pulling and verifying arm64 image from Docker Hub via QEMU..."
           docker run --rm --platform linux/arm64 "$IMAGE_TAG" flutter --version
+
