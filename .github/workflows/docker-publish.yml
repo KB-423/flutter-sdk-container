@@ -1,0 +1,119 @@
+name: Build and Publish Multi-Platform Flutter SDK Container
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: 'Flutter SDK version to build (e.g. 3.47.7, 3.29.0, stable)'
+        required: true
+        default: '3.47.7'
+        type: string
+      push_image:
+        description: 'Push image to registry'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEFAULT_FLUTTER_VERSION: '3.47.7'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_REPO || 'flutter-sdk-container' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine Flutter version
+        id: version
+        run: |
+          if [ -n "${{ inputs.flutter_version }}" ]; then
+            VERSION="${{ inputs.flutter_version }}"
+          elif [[ "${{ github.ref }}" =~ ^refs/tags/v?([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+          else
+            VERSION="${{ env.DEFAULT_FLUTTER_VERSION }}"
+          fi
+          echo "Selected Flutter version: $VERSION"
+          echo "flutter_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU for multi-platform build
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: github.event_name != 'pull_request' && (inputs.push_image != false)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (Optional)
+        if: github.event_name != 'pull_request' && (inputs.push_image != false) && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_USERNAME != '' && format('{0}/{1}', env.DOCKERHUB_USERNAME, env.DOCKERHUB_REPO) || '' }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.flutter_version }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push multi-platform Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            FLUTTER_VERSION=${{ steps.version.outputs.flutter_version }}
+          push: ${{ github.event_name != 'pull_request' && (inputs.push_image != false) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify built images via QEMU
+        if: github.event_name != 'pull_request' && (inputs.push_image != false)
+        run: |
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.flutter_version }}"
+          echo "Testing x86_64 image..."
+          docker run --rm --platform linux/amd64 "$IMAGE_TAG" flutter --version
+          echo "Testing arm64 image via QEMU..."
+          docker run --rm --platform linux/arm64 "$IMAGE_TAG" flutter --version
