@@ -2,21 +2,13 @@ name: Build and Publish Multi-Platform Flutter SDK Container
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - 'v*'
-  pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch:
     inputs:
       flutter_version:
         description: 'Flutter SDK version to build (e.g. 3.47.7, 3.29.0, stable)'
         required: true
-        default: '3.47.7'
         type: string
       push_image:
         description: 'Push image to registry'
@@ -27,14 +19,42 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  DEFAULT_FLUTTER_VERSION: '3.47.7'
 
 jobs:
-  build-and-push:
+  # 阶段 1：解析并校验目标 Flutter 版本
+  prepare:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    outputs:
+      flutter_version: ${{ steps.version.outputs.flutter_version }}
+    steps:
+      - name: Determine Flutter version
+        id: version
+        run: |
+          if [ -n "${{ inputs.flutter_version }}" ]; then
+            VERSION="${{ inputs.flutter_version }}"
+          elif [[ "${{ github.ref }}" =~ ^refs/tags/v?([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+          else
+            echo "Error: Flutter version is not specified! Please trigger via a tag (e.g. v3.47.7) or specify flutter_version in workflow_dispatch." >&2
+            exit 1
+          fi
+          echo "Target Flutter version: $VERSION"
+          echo "flutter_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # 阶段 2：独立申请 x64 (ubuntu-latest) 与 arm64 (ubuntu-24.04-arm) 两个硬件平台并行打包
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            platform-clean: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            platform-clean: linux-arm64
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -44,29 +64,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Determine Flutter version
-        id: version
-        run: |
-          if [ -n "${{ inputs.flutter_version }}" ]; then
-            VERSION="${{ inputs.flutter_version }}"
-          elif [[ "${{ github.ref }}" =~ ^refs/tags/v?([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
-            VERSION="${BASH_REMATCH[1]}"
-          else
-            VERSION="${{ env.DEFAULT_FLUTTER_VERSION }}"
-          fi
-          echo "Selected Flutter version: $VERSION"
-          echo "flutter_version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU for multi-platform build
+      # 若在非 ARM64 宿主机上构建 ARM64，则按需启用 QEMU 作为容灾后备
+      - name: Set up QEMU (fallback if running arm64 on x86 runner)
+        if: runner.arch != 'ARM64' && matrix.platform == 'linux/arm64'
         uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/amd64,linux/arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry (GHCR)
-        if: github.event_name != 'pull_request' && (inputs.push_image != false)
+        if: inputs.push_image != false
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -74,46 +81,139 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub (Optional)
-        if: github.event_name != 'pull_request' && (inputs.push_image != false) && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: inputs.push_image != false && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_USERNAME != '' && format('{0}/{1}', env.DOCKERHUB_USERNAME, env.DOCKERHUB_REPO) || '' }}
-          tags: |
-            type=raw,value=${{ steps.version.outputs.flutter_version }}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+      - name: Configure Buildx outputs
+        id: outputs
+        run: |
+          if [ "${{ inputs.push_image }}" = "false" ]; then
+            echo "build_outputs=type=image,push=false" >> "$GITHUB_OUTPUT"
+          else
+            OUTPUTS="type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true"
+            if [ -n "${{ env.DOCKERHUB_USERNAME }}" ] && [ -n "${{ env.DOCKERHUB_TOKEN }}" ]; then
+              OUTPUTS="${OUTPUTS}
+          type=image,name=${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPO }},push-by-digest=true,name-canonical=true,push=true"
+            fi
+            echo "build_outputs<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$OUTPUTS" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Build and push multi-platform Docker image
-        id: build-and-push
+      - name: Build and push single platform by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           build-args: |
-            FLUTTER_VERSION=${{ steps.version.outputs.flutter_version }}
-          push: ${{ github.event_name != 'pull_request' && (inputs.push_image != false) }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            FLUTTER_VERSION=${{ needs.prepare.outputs.flutter_version }}
+          outputs: ${{ steps.outputs.outputs.build_outputs }}
+          cache-from: type=gha,scope=${{ matrix.platform-clean }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform-clean }}
 
-      - name: Verify built images via QEMU
-        if: github.event_name != 'pull_request' && (inputs.push_image != false)
+      - name: Export digest artifact
+        if: inputs.push_image != false
         run: |
-          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.flutter_version }}"
-          echo "Testing x86_64 image..."
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        if: inputs.push_image != false
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform-clean }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 阶段 3：合并各架构 digest 并发布统一的多平台 manifest
+  merge:
+    needs: [prepare, build]
+    if: inputs.push_image != false
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_REPO || 'flutter-sdk-container' }}
+
+    steps:
+      - name: Download all platform digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (Optional)
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-platform manifest for GHCR
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          GHCR_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          VERSION="${{ needs.prepare.outputs.flutter_version }}"
+          SOURCES=$(printf "${GHCR_IMAGE}@sha256:%s " *)
+          echo "Assembling GHCR manifest from sources: $SOURCES"
+          docker buildx imagetools create \
+            -t "${GHCR_IMAGE}:${VERSION}" \
+            -t "${GHCR_IMAGE}:latest" \
+            $SOURCES
+
+      - name: Create and push multi-platform manifest for Docker Hub (Optional)
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          DH_IMAGE="${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPO }}"
+          VERSION="${{ needs.prepare.outputs.flutter_version }}"
+          SOURCES=$(printf "${DH_IMAGE}@sha256:%s " *)
+          echo "Assembling Docker Hub manifest from sources: $SOURCES"
+          docker buildx imagetools create \
+            -t "${DH_IMAGE}:${VERSION}" \
+            -t "${DH_IMAGE}:latest" \
+            $SOURCES
+
+  # 阶段 4：通过 QEMU 与原生执行验证已发布的多平台镜像
+  verify:
+    needs: [prepare, merge]
+    if: inputs.push_image != false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up QEMU for verification
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify multi-arch images
+        run: |
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.flutter_version }}"
+          echo "===> Pulling and verifying x86_64 image..."
           docker run --rm --platform linux/amd64 "$IMAGE_TAG" flutter --version
-          echo "Testing arm64 image via QEMU..."
+          echo "===> Pulling and verifying arm64 image via QEMU..."
           docker run --rm --platform linux/arm64 "$IMAGE_TAG" flutter --version
