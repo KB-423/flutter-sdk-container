@@ -10,11 +10,6 @@ on:
         description: "Flutter SDK version to build"
         required: true
         type: string
-      push_image:
-        description: "Push image to Docker Hub"
-        required: true
-        default: true
-        type: boolean
 
 jobs:
   # 阶段 1：解析并校验目标 Flutter 版本与 Docker Hub 凭据
@@ -82,16 +77,12 @@ jobs:
       - name: Configure Buildx outputs
         id: outputs
         run: |
-          if [ "${{ inputs.push_image }}" = "false" ]; then
-            echo "build_outputs=type=image,push=false" >> "$GITHUB_OUTPUT"
-          else
-            DH_USER=$(echo "${{ vars.DOCKERHUB_USERNAME }}" | tr '[:upper:]' '[:lower:]')
-            DH_REPO=$(echo "${{ vars.DOCKERHUB_REPO || 'flutter-sdk-container' }}" | tr '[:upper:]' '[:lower:]')
-            FULL_IMAGE="${DH_USER}/${DH_REPO}"
-            echo "Resolved Docker Hub target: $FULL_IMAGE"
-            OUTPUTS="type=image,name=${FULL_IMAGE},push-by-digest=true,name-canonical=true,push=true"
-            echo "build_outputs=$OUTPUTS" >> "$GITHUB_OUTPUT"
-          fi
+          DH_USER=$(echo "${{ vars.DOCKERHUB_USERNAME }}" | tr '[:upper:]' '[:lower:]')
+          DH_REPO=$(echo "${{ vars.DOCKERHUB_REPO || 'flutter-sdk-container' }}" | tr '[:upper:]' '[:lower:]')
+          FULL_IMAGE="${DH_USER}/${DH_REPO}"
+          echo "Resolved Docker Hub target: $FULL_IMAGE"
+          OUTPUTS="type=image,name=${FULL_IMAGE},push-by-digest=true,name-canonical=true,push=true"
+          echo "build_outputs=$OUTPUTS" >> "$GITHUB_OUTPUT"
 
       - name: Build and push single platform by digest to Docker Hub
         id: build
@@ -107,14 +98,12 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.platform-clean }}
 
       - name: Export digest artifact
-        if: inputs.push_image != false
         run: |
           mkdir -p ${{ runner.temp }}/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest artifact
-        if: inputs.push_image != false
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ matrix.platform-clean }}
@@ -125,7 +114,6 @@ jobs:
   # 阶段 3：合并各架构 digest 并向 Docker Hub 发布统一的多平台 manifest
   merge:
     needs: [prepare, build]
-    if: inputs.push_image != false
     runs-on: ubuntu-latest
 
     steps:
@@ -162,7 +150,6 @@ jobs:
   # 阶段 4：从 Docker Hub 拉取并验证多平台镜像
   verify:
     needs: [prepare, merge]
-    if: inputs.push_image != false
     runs-on: ubuntu-latest
     steps:
       - name: Set up QEMU for verification
