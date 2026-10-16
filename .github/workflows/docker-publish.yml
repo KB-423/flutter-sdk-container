@@ -28,7 +28,7 @@ jobs:
           elif [[ "${{ github.ref }}" =~ ^refs/tags/(.*)$ ]]; then
             VERSION="${BASH_REMATCH[1]}"
           else
-            echo "Error: Flutter version is not specified! Please trigger via a tag (e.g. 3.47.7 or v3.47.7) or specify flutter_version in workflow_dispatch." >&2
+            echo "Error: Flutter version is not specified! Please trigger via a tag or specify flutter_version in workflow_dispatch." >&2
             exit 1
           fi
           echo "Target Flutter version: $VERSION"
